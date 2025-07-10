@@ -1,6 +1,3 @@
-import eventlet
-eventlet.monkey_patch()
-
 from celery.result import AsyncResult
 from fastapi import FastAPI, status, HTTPException, Form
 import uvicorn

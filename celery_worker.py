@@ -1,4 +1,7 @@
 from celery import Celery
+from redlock import Redlock
+import hashlib
+import redis
 
 import requests
 import random
@@ -13,6 +16,13 @@ celery_app = Celery(
     broker='redis://parser_redis:6379/0',
     backend='redis://parser_redis:6379/0',
 )
+
+redis_client = redis.Redis(host='parser_redis', port=6379, db=0)
+dlm = Redlock([redis_client])
+
+SEMAPHORE_SLOTS = 3
+LOCK_TTL = 60000
+RETRY_DELAY = 15
 
 
 def get_random_user_agent():
@@ -30,91 +40,57 @@ def get_random_user_agent():
 @celery_app.task(
     bind=True,
     name='parse_url',
-    autoretry_for=(ManyRespError, ServerError),
+    autoretry_for=(ManyRespError, ServerError, requests.exceptions.RequestException),
     retry_kwargs={'max_retries': 5},
-    retry_backoff=True,
-    retry_backoff_base=10,
+    retry_backoff=10,
     retry_backoff_max=100,
     retry_jitter=True,
 )
 def parse_url(self, url: str):
-    proxies = []
 
-    headers = {
-        'User-Agent': get_random_user_agent()
-    }
+    url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+    lock_keys = [f"lock:{url_hash}:{i}" for i in range(SEMAPHORE_SLOTS)]
+
+    acquired_lock = None
+    for key in lock_keys:
+        acquired_lock = dlm.lock(key, LOCK_TTL)
+        if acquired_lock:
+            logger.info('Task %s acquired lock %s for URL %s', self.request.id, key, url)
+            break
+
+    if not acquired_lock:
+        logger.warning('Task %s failed to acquire lock for URL %s. All %s slots are busy. Retrying in %ss.', self.request.id, url, SEMAPHORE_SLOTS, RETRY_DELAY)
+        raise self.retry(countdown=RETRY_DELAY, max_retries=None) # Retry indefinitely until a lock is free
 
     try:
-        response = requests.get(url, headers=headers, proxies=proxies)
-        print(response.status_code)
+        proxies = []
+        headers = {
+            'User-Agent': get_random_user_agent()
+        }
 
-        if response.status_code == 200:
-            return response.text
+        try:
+            response = requests.get(url, headers=headers, proxies=proxies)
+            print(response.status_code)
 
-        elif response.status_code == 429:
-            raise ManyRespError(f'To many response error to {url}')
+            if response.status_code == 200:
+                return response.text
 
-        elif response.status_code == 403:
-            raise Response403Error(f'Error when get response to {url}')
+            elif response.status_code == 429:
+                raise ManyRespError(f'To many response error to {url}')
 
-        elif response.status_code >= 500:
-            raise ServerError(f'Server error when get response to {url}')
+            elif response.status_code == 403:
+                raise Response403Error(f'Error when get response to {url}')
 
-        else:
-            raise Exception(f'Unknown error when get response to {url}')
+            elif response.status_code >= 500:
+                raise ServerError(f'Server error when get response to {url}')
 
+            else:
+                raise Exception(f'Unknown error when get response to {url}')
 
-    except ManyRespError as e:
+        except Exception as e:
+            raise e
 
-        print(f"Caught ManyRespError: {e}. Preparing for retry...")
-
-        self.update_state(
-
-            state='RETRYING',
-            meta={
-                'current_attempt': self.request.retries + 1,
-                'max_attempts': self.max_retries,
-                'exc_type': type(e).__name__,
-                'exc_message': str(e),
-                'reason': 'Too many requests'
-            }
-        )
-        raise self.retry(exc=e)
-
-    except ServerError as e:
-
-        print(f"Caught ServerError: {e}. Preparing for retry...")
-        self.update_state(
-            state='RETRYING',
-            meta={
-                'current_attempt': self.request.retries + 1,
-                'max_attempts': self.max_retries,
-                'exc_type': type(e).__name__,
-                'exc_message': str(e),
-                'reason': 'Server side issue'
-            }
-        )
-        raise self.retry(exc=e)
-
-    except requests.exceptions.RequestException as e:
-        print(f"Caught RequestException (network error): {e}. Retrying if not max retries...")
-        self.update_state(
-            state='RETRYING' if self.request.retries < self.max_retries else 'FAILURE',
-            meta={
-                'current_attempt': self.request.retries + 1,
-                'max_attempts': self.max_retries,
-                'exc_type': type(e).__name__,
-                'exc_message': str(e),
-                'reason': 'Network error'
-            }
-        )
-        if self.request.retries < self.max_retries:
-            raise self.retry(exc=e)
-        else:
-            raise
-
-
-    except Exception as e:
-        print(f"Caught unhandled Exception: {e}. Marking as FAILURE.")
-        self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
-        raise e
+    finally:
+        if acquired_lock:
+            dlm.unlock(acquired_lock)
+            logger.info('Task %s released lock for URL %s', self.request.id, url)
