@@ -60,7 +60,7 @@ def parse_url(self, url: str):
 
     if not acquired_lock:
         logger.warning('Task %s failed to acquire lock for URL %s. All %s slots are busy. Retrying in %ss.', self.request.id, url, SEMAPHORE_SLOTS, RETRY_DELAY)
-        raise self.retry(countdown=RETRY_DELAY, max_retries=None) # Retry indefinitely until a lock is free
+        raise self.retry(countdown=RETRY_DELAY, max_retries=None)
 
     try:
         proxies = []
