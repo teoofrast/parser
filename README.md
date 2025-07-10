@@ -21,8 +21,8 @@
 1.	**Клонируйте репозиторий** (если вы еще этого не сделали):
 
     ```bash
-    git clone <ваш-url-репозитория>
-    cd parser # или имя вашей директории проекта
+    git clone https://github.com/teoofrast/parser.git
+    cd parser
     ```
 
 2.	**Соберите и запустите Docker-контейнеры**:
